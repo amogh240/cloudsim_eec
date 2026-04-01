@@ -50,6 +50,15 @@ VMId_t Scheduler::GetOrCreateVM(CPUType_t cpu, VMType_t vm) {
 
 // Attach a VM to a machine, updating all tracking structures
 void Scheduler::AttachVMToMachine(VMId_t vm_id, MachineId_t machine_id) {
+    MachineInfo_t dbg = Machine_GetInfo(machine_id);
+    SimOutput("DEBUG AttachVM: vm=" + to_string(vm_id) + " machine=" + to_string(machine_id) +
+              " s_state=" + to_string(dbg.s_state) + " local_s=" + to_string(machine_records[machine_id].current_s_state) +
+              " waking=" + to_string(machine_records[machine_id].is_waking_up) +
+              " transitioning=" + to_string(machine_records[machine_id].is_transitioning), 0);
+    if (dbg.s_state != S0) {
+        SimOutput("WARN AttachVM: Machine " + to_string(machine_id) + " not at S0, skipping attach", 0);
+        return;
+    }
     VM_Attach(vm_id, machine_id);
     vm_to_machine[vm_id] = machine_id;
     machine_records[machine_id].attached_vms.push_back(vm_id);
@@ -71,6 +80,7 @@ void Scheduler::TryPowerDownMachine(MachineId_t machine_id) {
     MachineRecord &rec = machine_records[machine_id];
     if (rec.current_s_state != S0 && rec.current_s_state != S0i1) return; // already sleeping
     if (rec.is_waking_up) return;
+    if (migration_targets.count(machine_id)) return; // has incoming migrations
 
     MachineInfo_t info = Machine_GetInfo(machine_id);
     if (info.active_tasks > 0 || info.active_vms > 0) return; // still has work
@@ -78,14 +88,23 @@ void Scheduler::TryPowerDownMachine(MachineId_t machine_id) {
     // Shut down all VMs on this machine first
     auto vms_copy = rec.attached_vms;  // copy because we modify during loop
     for (auto vm_id : vms_copy) {
-        VMInfo_t vi = VM_GetInfo(vm_id);
-        if (vi.active_tasks.empty()) {
-            VM_Shutdown(vm_id);
-            // Remove from tracking
+        try {
+            VMInfo_t vi = VM_GetInfo(vm_id);
+            if (vi.active_tasks.empty()) {
+                VM_Shutdown(vm_id);
+                // Remove from tracking
+                auto it = find(rec.attached_vms.begin(), rec.attached_vms.end(), vm_id);
+                if (it != rec.attached_vms.end()) rec.attached_vms.erase(it);
+                vm_to_machine.erase(vm_id);
+                // Remove from vms list
+                auto it2 = find(vms.begin(), vms.end(), vm_id);
+                if (it2 != vms.end()) vms.erase(it2);
+            }
+        } catch (...) {
+            // VM may already be inactive — remove from local tracking
             auto it = find(rec.attached_vms.begin(), rec.attached_vms.end(), vm_id);
             if (it != rec.attached_vms.end()) rec.attached_vms.erase(it);
             vm_to_machine.erase(vm_id);
-            // Remove from vms list
             auto it2 = find(vms.begin(), vms.end(), vm_id);
             if (it2 != vms.end()) vms.erase(it2);
         }
@@ -96,6 +115,7 @@ void Scheduler::TryPowerDownMachine(MachineId_t machine_id) {
     if (info.active_vms == 0) {
         Machine_SetState(machine_id, S5);
         rec.current_s_state = S5;
+        rec.is_transitioning = true;
         SimOutput("PowerDown: Machine " + to_string(machine_id) + " -> S5", 2);
     }
 }
@@ -115,7 +135,7 @@ MachineId_t Scheduler::WakeUpBestMachine(CPUType_t cpu) {
     int best_s = S5 + 1;
     for (unsigned i = 0; i < total_machines; i++) {
         MachineRecord &rec = machine_records[i];
-        if (rec.cpu == cpu && rec.current_s_state != S0 && rec.current_s_state != S0i1 && !rec.is_waking_up) {
+        if (rec.cpu == cpu && rec.current_s_state != S0 && rec.current_s_state != S0i1 && !rec.is_waking_up && !rec.is_transitioning) {
             if ((int)rec.current_s_state < best_s) {
                 best_s = (int)rec.current_s_state;
                 best = rec.id;
@@ -126,6 +146,7 @@ MachineId_t Scheduler::WakeUpBestMachine(CPUType_t cpu) {
     if (best != (MachineId_t)-1) {
         Machine_SetState(best, S0);
         machine_records[best].is_waking_up = true;
+        machine_records[best].is_transitioning = true;
         SimOutput("WakeUp: Machine " + to_string(best) + " from S" + to_string(best_s) + " -> S0", 2);
     }
     return best;
@@ -378,21 +399,32 @@ MachineId_t Scheduler::FindBestMachine_RoundRobin(CPUType_t cpu, unsigned mem_ne
 // ============================================================================
 
 void Scheduler::ConsolidateCheck() {
-    // Find underloaded machines and try to migrate their VMs to other machines
+    // Track which machines are sources/targets in this consolidation pass
+    unordered_set<unsigned> sources_this_pass;
+
+    // First pass: power down idle machines (no VMs, no incoming migrations)
     for (unsigned i = 0; i < total_machines; i++) {
         MachineRecord &rec = machine_records[i];
         if (rec.current_s_state != S0) continue;
-        if (rec.is_waking_up) continue;
+        if (rec.is_waking_up || rec.is_transitioning) continue;
+        if (migration_targets.count(rec.id)) continue; // has incoming migration
 
         MachineInfo_t info = Machine_GetInfo(rec.id);
         if (info.active_tasks == 0 && info.active_vms == 0) {
             TryPowerDownMachine(rec.id);
-            continue;
         }
+    }
 
+    // Second pass: consolidate underloaded machines
+    for (unsigned i = 0; i < total_machines; i++) {
+        MachineRecord &rec = machine_records[i];
+        if (rec.current_s_state != S0) continue;
+        if (rec.is_waking_up || rec.is_transitioning) continue;
+
+        MachineInfo_t info = Machine_GetInfo(rec.id);
         double util = (info.num_cpus > 0) ? (double)info.active_tasks / (double)info.num_cpus : 0.0;
 
-        // Only consolidate if very underloaded
+        // Only consolidate if very underloaded and has tasks
         if (util > 0.20 || info.active_tasks == 0) continue;
 
         // Try to migrate VMs off this machine
@@ -412,12 +444,17 @@ void Scheduler::ConsolidateCheck() {
             double best_util = -1.0;
             for (unsigned j = 0; j < total_machines; j++) {
                 if (j == i) continue;
+                // Don't target a machine that was a source this pass (prevents cross-migration)
+                if (sources_this_pass.count(j)) continue;
                 MachineRecord &trec = machine_records[j];
                 if (trec.cpu != rec.cpu) continue;
                 if (trec.current_s_state != S0) continue;
-                if (trec.is_waking_up) continue;
+                if (trec.is_waking_up || trec.is_transitioning) continue;
 
                 MachineInfo_t tinfo = Machine_GetInfo(trec.id);
+                // Double-check simulator's actual state
+                if (tinfo.s_state != S0) continue;
+
                 unsigned free_mem = (tinfo.memory_size > tinfo.memory_used) ? (tinfo.memory_size - tinfo.memory_used) : 0;
                 if (free_mem < vm_mem + VM_MEMORY_OVERHEAD) continue;
 
@@ -433,8 +470,10 @@ void Scheduler::ConsolidateCheck() {
             if (target != (MachineId_t)-1) {
                 VM_Migrate(vm_id, target);
                 migrating_vms.insert(vm_id);
+                migration_targets.insert(target);
+                sources_this_pass.insert(i);
                 SimOutput("Consolidate: Migrating VM " + to_string(vm_id) + " from machine " + to_string(rec.id) + " to " + to_string(target), 2);
-                break; // Only one migration at a time per machine to avoid overload
+                break; // Only one migration at a time per machine
             }
         }
     }
@@ -467,6 +506,7 @@ void Scheduler::Init() {
         rec.p_states_power = info.p_states;
         rec.s_states_power = info.s_states;
         rec.is_waking_up = false;
+        rec.is_transitioning = false;
         rec.active_task_count = 0;
         rec.memory_used = 0;
         machines.push_back(MachineId_t(i));
@@ -479,80 +519,35 @@ void Scheduler::Init() {
     }
 
 #if ALGORITHM == 1
-    // E-Eco: Start with a small number of active machines per CPU type
-    // Create one VM per active machine
+    // E-Eco: Start with all machines active, each with a LINUX VM.
+    // Idle machines will be powered down by PeriodicCheck once the simulation stabilizes.
     {
-        // Keep about 1/3 of each CPU type active initially
-        unordered_map<unsigned, unsigned> active_per_cpu;
-        for (auto &p : cpu_count) {
-            unsigned keep = max(1u, p.second / 3);
-            active_per_cpu[p.first] = keep;
-        }
-
-        unordered_map<unsigned, unsigned> count_per_cpu;
         for (unsigned i = 0; i < total_machines; i++) {
-            unsigned cpu_key = (unsigned)machine_records[i].cpu;
-            count_per_cpu[cpu_key]++;
-
-            if (count_per_cpu[cpu_key] <= active_per_cpu[cpu_key]) {
-                // Keep this machine active — create a LINUX VM on it
-                VMId_t vm_id = VM_Create(LINUX, machine_records[i].cpu);
-                vms.push_back(vm_id);
-                AttachVMToMachine(vm_id, MachineId_t(i));
-            } else {
-                // Power down
-                Machine_SetState(MachineId_t(i), S5);
-                machine_records[i].current_s_state = S5;
-            }
+            VMId_t vm_id = VM_Create(LINUX, machine_records[i].cpu);
+            vms.push_back(vm_id);
+            AttachVMToMachine(vm_id, MachineId_t(i));
         }
     }
 #elif ALGORITHM == 2
-    // DVFS-BFD: Start with half the machines active, rest powered down
+    // DVFS-BFD: Start with all machines active, start at P1 for energy savings.
+    // Idle machines will be powered down by PeriodicCheck.
     {
-        unordered_map<unsigned, unsigned> active_per_cpu;
-        for (auto &p : cpu_count) {
-            active_per_cpu[p.first] = max(1u, p.second / 2);
-        }
-
-        unordered_map<unsigned, unsigned> count_per_cpu;
         for (unsigned i = 0; i < total_machines; i++) {
-            unsigned cpu_key = (unsigned)machine_records[i].cpu;
-            count_per_cpu[cpu_key]++;
-
-            if (count_per_cpu[cpu_key] <= active_per_cpu[cpu_key]) {
-                VMId_t vm_id = VM_Create(LINUX, machine_records[i].cpu);
-                vms.push_back(vm_id);
-                AttachVMToMachine(vm_id, MachineId_t(i));
-                // Start at P1 for energy savings
-                Machine_SetCorePerformance(MachineId_t(i), 0, P1);
-                machine_records[i].current_p_state = P1;
-            } else {
-                Machine_SetState(MachineId_t(i), S5);
-                machine_records[i].current_s_state = S5;
-            }
+            VMId_t vm_id = VM_Create(LINUX, machine_records[i].cpu);
+            vms.push_back(vm_id);
+            AttachVMToMachine(vm_id, MachineId_t(i));
+            Machine_SetCorePerformance(MachineId_t(i), 0, P1);
+            machine_records[i].current_p_state = P1;
         }
     }
 #elif ALGORITHM == 3
-    // SLA-Tiered: Keep 1/4 active per CPU type, rest powered down
+    // SLA-Tiered: Start with all machines active.
+    // Idle machines will be powered down by PeriodicCheck.
     {
-        unordered_map<unsigned, unsigned> active_per_cpu;
-        for (auto &p : cpu_count) {
-            active_per_cpu[p.first] = max(1u, p.second / 4);
-        }
-
-        unordered_map<unsigned, unsigned> count_per_cpu;
         for (unsigned i = 0; i < total_machines; i++) {
-            unsigned cpu_key = (unsigned)machine_records[i].cpu;
-            count_per_cpu[cpu_key]++;
-
-            if (count_per_cpu[cpu_key] <= active_per_cpu[cpu_key]) {
-                VMId_t vm_id = VM_Create(LINUX, machine_records[i].cpu);
-                vms.push_back(vm_id);
-                AttachVMToMachine(vm_id, MachineId_t(i));
-            } else {
-                Machine_SetState(MachineId_t(i), S5);
-                machine_records[i].current_s_state = S5;
-            }
+            VMId_t vm_id = VM_Create(LINUX, machine_records[i].cpu);
+            vms.push_back(vm_id);
+            AttachVMToMachine(vm_id, MachineId_t(i));
         }
     }
 #else
@@ -829,6 +824,7 @@ void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
     // Update vm_to_machine mapping
     VMInfo_t vi = VM_GetInfo(vm_id);
     MachineId_t new_machine = vi.machine_id;
+    migration_targets.erase(new_machine);
 
     // Remove from old machine record
     MachineId_t old_machine = vm_to_machine[vm_id];
@@ -853,6 +849,7 @@ void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
 void Scheduler::HandleStateChange(Time_t time, MachineId_t machine_id) {
     MachineInfo_t info = Machine_GetInfo(machine_id);
     machine_records[machine_id].current_s_state = info.s_state;
+    machine_records[machine_id].is_transitioning = false;
 
     if (info.s_state == S0) {
         machine_records[machine_id].is_waking_up = false;
@@ -903,8 +900,14 @@ void Scheduler::HandleMemoryWarning(Time_t time, MachineId_t machine_id) {
 
             MachineInfo_t tinfo = Machine_GetInfo(trec.id);
             if (tinfo.memory_size - tinfo.memory_used > rec.memory_size / 4) {
+                MachineInfo_t tdbg = Machine_GetInfo(trec.id);
+                if (tdbg.s_state != S0) {
+                    SimOutput("WARN MemoryMigrate: target machine " + to_string(trec.id) + " not S0, skipping", 0);
+                    continue;
+                }
                 VM_Migrate(vm_id, trec.id);
                 migrating_vms.insert(vm_id);
+                migration_targets.insert(trec.id);
                 SimOutput("MemoryMigrate: VM " + to_string(vm_id) + " -> machine " + to_string(trec.id), 2);
                 return;
             }
@@ -919,17 +922,23 @@ void Scheduler::HandleMemoryWarning(Time_t time, MachineId_t machine_id) {
 void Scheduler::Shutdown(Time_t time) {
     SimOutput("Scheduler::Shutdown at time " + to_string(time), 1);
 
-    // Shut down all VMs
-    for (auto &vm_id : vms) {
+    // Shut down all remaining VMs — iterate over a copy since VM_Shutdown may modify state
+    auto vms_copy = vms;
+    for (auto vm_id : vms_copy) {
         try {
             VMInfo_t vi = VM_GetInfo(vm_id);
+            // Only shut down if the VM is still attached and has no tasks
             if (vi.active_tasks.empty()) {
                 VM_Shutdown(vm_id);
             }
+        } catch (const runtime_error &) {
+            // VM was already shut down or invalid — ignore
         } catch (...) {
-            // VM may already be shut down
+            // Catch all other exceptions
         }
     }
+    vms.clear();
+    vm_to_machine.clear();
 
     SimOutput("Scheduler::Shutdown complete", 1);
 }

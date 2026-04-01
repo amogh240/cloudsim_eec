@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include <cstdint>
 #include "Interfaces.h"
 
 // ============================================================================
@@ -40,6 +41,7 @@ struct MachineRecord {
     vector<unsigned> p_states_power;
     vector<unsigned> s_states_power;
     bool is_waking_up;           // true while transitioning to S0
+    bool is_transitioning;       // true while any state transition is in progress
     unsigned active_task_count;
     unsigned memory_used;
     vector<VMId_t> attached_vms;
@@ -70,6 +72,7 @@ private:
     // VM tracking
     unordered_map<VMId_t, MachineId_t> vm_to_machine;
     unordered_set<VMId_t> migrating_vms;
+    unordered_set<MachineId_t> migration_targets; // machines with incoming migrations
 
     // Task tracking
     unordered_map<TaskId_t, VMId_t> task_to_vm;
