@@ -71,12 +71,19 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         double core_power = info.p_states[0]; // P0 core power (worst case)
 
         double cost;
-        if (info.active_tasks == 0) {
+        if (sla >= SLA2) {
+            // SLA2/SLA3: prefer lightly-loaded machines to avoid
+            // priority starvation from HIGH_PRIORITY tasks
+            cost = core_power * (info.active_tasks + 1.0);
+        } else if (info.active_tasks == 0) {
             // going from idle to active -- expensive
             cost = base_power + core_power;
-        } else {
-            // already active -- marginal cost is just one more core
+        } else if (info.active_tasks < info.num_cpus) {
+            // already active, cores available -- cheap to add
             cost = core_power / (info.active_tasks + 1.0);
+        } else {
+            // oversubscribed: penalize to spread burst tasks
+            cost = core_power * (double)(info.active_tasks - info.num_cpus + 2);
         }
 
         if (cost < best_cost) {
