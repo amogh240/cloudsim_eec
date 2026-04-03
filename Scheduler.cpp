@@ -38,6 +38,9 @@ void Scheduler::Init() {
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     CPUType_t required_cpu = RequiredCPUType(task_id);
     SLAType_t sla = RequiredSLA(task_id);
+    TaskInfo_t tinfo = GetTaskInfo(task_id);
+    bool gpu_capable = IsTaskGPUCapable(task_id);
+    unsigned task_mem = GetTaskMemory(task_id);
 
     Priority_t priority;
     if (sla <= SLA1) priority = HIGH_PRIORITY;
@@ -45,11 +48,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     else priority = LOW_PRIORITY;
 
     // greedy: pick the compatible machine where adding this task costs
-    // the least additional energy. A machine already running N tasks
-    // is already paying its base S-state power, so the marginal cost
-    // is just the per-core dynamic power at its current P-state.
-    // An idle machine would need to ramp up from scratch (high cost).
-    // So we score by: (p_state power) / (active_tasks + 1)
+    // the least additional energy, subject to SLA feasibility.
     // Lower score = cheaper to add a task here.
 
     MachineId_t best = (MachineId_t)-1;
@@ -61,13 +60,20 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         if (info.cpu != required_cpu) continue;
 
         // skip machines that are already tight on memory
-        unsigned task_mem = GetTaskMemory(task_id);
         if (info.memory_used + task_mem > info.memory_size) continue;
 
-        // marginal energy cost estimate:
-        // if machine is idle, adding a task means we pay full S0 + core power
-        // if machine is busy, core power is already being paid, marginal = small
-        double base_power = info.s_states[0]; // S0 power
+        // SLA deadline feasibility: skip machines where estimated
+        // completion time (with current load) would exceed the deadline
+        if (sla <= SLA1 && info.performance.size() > 0) {
+            double mips = info.performance[0]; // MIPS at P0
+            double single_runtime = (double)tinfo.total_instructions / mips;
+            double time_budget = (double)(tinfo.target_completion - tinfo.arrival);
+            unsigned total_tasks = info.active_tasks + 1;
+            double load_factor = (total_tasks > info.num_cpus)
+                ? (double)total_tasks / info.num_cpus : 1.0;
+            if (single_runtime * load_factor > time_budget) continue;
+        }
+
         double core_power = info.p_states[0]; // P0 core power (worst case)
 
         double cost;
@@ -76,14 +82,19 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
             // priority starvation from HIGH_PRIORITY tasks
             cost = core_power * (info.active_tasks + 1.0);
         } else if (info.active_tasks == 0) {
-            // going from idle to active -- expensive
-            cost = base_power + core_power;
+            // machine already at S0, base power is sunk cost
+            cost = core_power;
         } else if (info.active_tasks < info.num_cpus) {
             // already active, cores available -- cheap to add
             cost = core_power / (info.active_tasks + 1.0);
         } else {
             // oversubscribed: penalize to spread burst tasks
             cost = core_power * (double)(info.active_tasks - info.num_cpus + 2);
+        }
+
+        // GPU-capable tasks strongly prefer GPU machines
+        if (gpu_capable && info.gpus) {
+            cost *= 0.1;
         }
 
         if (cost < best_cost) {
