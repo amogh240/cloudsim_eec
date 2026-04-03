@@ -60,6 +60,10 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         if (info.s_state != S0) continue;
         if (info.cpu != required_cpu) continue;
 
+        // skip machines that are already tight on memory
+        unsigned task_mem = GetTaskMemory(task_id);
+        if (info.memory_used + task_mem > info.memory_size) continue;
+
         // marginal energy cost estimate:
         // if machine is idle, adding a task means we pay full S0 + core power
         // if machine is busy, core power is already being paid, marginal = small
